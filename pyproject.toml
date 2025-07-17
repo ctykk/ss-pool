@@ -7,3 +7,8 @@ dependencies = [
     "patchright>=1.52.5",
     "playwright>=1.52.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+]
