@@ -14,3 +14,4 @@ uv.lock
 # Other
 .vscode/
 *.code-workspace
+/[Tt][Ee][Mm][Pp]*
