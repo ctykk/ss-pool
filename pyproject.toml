@@ -9,6 +9,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "colorama>=0.4.6",
     "patchright>=1.52.5",
     "playwright>=1.53.0",
 ]
