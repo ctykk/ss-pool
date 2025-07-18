@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from asyncio import Queue, gather, sleep
+from asyncio import CancelledError, Queue, QueueFull, Semaphore, create_task, gather, sleep
 from asyncio.subprocess import DEVNULL, Process, create_subprocess_exec
 from contextlib import asynccontextmanager
 from random import randint
+from time import monotonic
 from typing import Any, AsyncGenerator, Collection, Final, Self
 
 from .util import tests
@@ -29,16 +30,25 @@ class Proxy:
 
     @property
     def url(self) -> str:
-        """代理的访问链接，仅能在代理进程已启动时使用"""
+        """
+        代理的访问链接，仅能在节点已启动时使用
+
+        :raises ProxyError: 节点未启动
+        """
         if self.is_started():
             return f'http://localhost:{self._port}'
         raise ProxyError('代理未启动')
 
     def is_started(self) -> bool:
+        """节点是否启动"""
         return self._process is not None and self._process.returncode is None
 
     async def start(self, port: int | None = None) -> None:
-        """启动代理进程，如果给定端口则仅尝试一次，否则随机尝试直到成功"""
+        """
+        启动节点，如果给定端口则仅尝试一次，否则随机尝试直到成功
+
+        :raises ProxyError: 传入了端口且端口不可用
+        """
         while True:
             try:
                 return await self._start(randint(10000, 60000) if port is None else port)
@@ -74,7 +84,7 @@ class Proxy:
         raise ProxyError('启动失败，可能是端口已被占用')
 
     def stop(self) -> None:
-        """关闭代理进程"""
+        """关闭节点"""
         if self._process is not None:
             # 节点尚未关闭
             if self._process.returncode is None:
@@ -102,50 +112,123 @@ class ProxyPool:
     """网络代理池"""
 
     """
-    TODO
-    - 代理中途失效时如何暂时禁用它？
-    - 代理过了禁用时间后如何恢复它？
-    - 如何限制同时启动的最大节点数？（只启动这么多个节点，其余的节点作为当前已启动节点被禁用后的备胎）
+    # TODO
+    - 节点中途失效时如何暂时禁用它？（因不同调用方的实现判定不同，是否需要禁用由调用方判定）
+    - 节点过了禁用时间后如何恢复它？
+    - 如何限制同时使用的最大节点数？（只启动这么多个节点，其余的节点作为当前使用节点被禁用后的备胎）
     """
 
-    def __init__(self, proxies: Collection[Proxy]) -> None:
-        self._all_proxies: list[Proxy] = list(set(proxies))  # 所有节点（去重）
-        self._available_proxies: Queue[Proxy] = Queue()  # 可用的节点
+    def __init__(
+        self, proxies: Collection[Proxy], max_active: int = 0, disable_until: float = 60
+    ) -> None:
+        """
+        :param max_active: 同时能使用的最大节点数（小于等于 0 为无限制）
+        :param disable_until: 节点禁用持续时间（秒）
+        """
+        self._max_active = max_active
+        self._max_active_sem = Semaphore(self._max_active)  # 限制同时能使用的最大节点数
+        self._disable_until: float = disable_until
+
+        self._all: list[Proxy] = list(set(proxies))  # 所有节点（去重）
+        self._active: Queue[Proxy] = Queue(maxsize=self._max_active)  # 激活的节点
+        self._standby: Queue[Proxy] = Queue()  # 后备节点
+        self._disabled: dict[Proxy, float] = dict()  # 被禁用节点与其禁用到期时间
 
     async def acquire(self) -> Proxy:
         """获取一个节点"""
-        return await self._available_proxies.get()
+        # 持续从 active 中获取节点，直到找到为未被禁用的节点
+        await self._max_active_sem.acquire()
+
+        while True:
+            # 从 active 获取节点，若 active 已空从 standby 获取
+            if self._active.empty():
+                proxy = await self._standby.get()
+            else:
+                proxy = await self._active.get()
+
+            # 如果节点未被禁用就使用该节点
+            if proxy not in self._disabled:
+                break
+
+            # TODO 如果 active 和 standby 都没有可用节点，会陷入死循环持续占用 CPU 吗？
+            self._standby.put_nowait(proxy)
+
+        # 节点未启动就启动它
+        if not proxy.is_started():
+            await proxy.start()
+
+        return proxy
 
     def release(self, proxy: Proxy) -> None:
         """释放一个节点"""
-        self._available_proxies.put_nowait(proxy)
+        # 节点仍处于禁用状态，就关闭其进程
+        if proxy in self._disabled and self._disabled[proxy] > monotonic():
+            proxy.stop()
+            return
+
+        # 节点仍可用，将节点放回 active，active 已满就放到 standby
+        try:
+            self._active.put_nowait(proxy)
+        except QueueFull:
+            self._standby.put_nowait(proxy)
+
+        self._max_active_sem.release()
 
     @asynccontextmanager
     async def get(self) -> AsyncGenerator[Proxy]:
+        """acquire + release"""
         proxy = await self.acquire()
         try:
             yield proxy
         finally:
             self.release(proxy)
 
+    def disable(self, proxy: Proxy) -> None:
+        """禁用该节点"""
+        self._disabled[proxy] = monotonic() + self._disable_until
+
+    async def _recover(self) -> None:
+        """恢复任务"""
+        while True:
+            # 删除 disable 中所有可恢复的节点
+            now = monotonic()
+            recoverable = (p for p, t in self._disabled.items() if t < now)
+            for p in recoverable:
+                self._disabled.pop(p)
+
+            try:
+                await sleep(self._disable_until / 2)
+            except CancelledError:
+                return
+
     async def start(self) -> Self:
         """启动代理池"""
         # 启动所有节点
-        await gather(*[p.start() for p in self._all_proxies])
+        await gather(*[p.start() for p in self._all])
         # 测试所有节点的有效性
-        proxy_status = await tests(*self._all_proxies, timeout=10)
-        # 去除所有无效节点
+        proxy_status = await tests(*self._all, timeout=10)
         for p, s in proxy_status.items():
-            # 节点通过检测
+            # 节点通过检测，将节点放入 active，active 已满就放到 standby
             if s:
-                self._available_proxies.put_nowait(p)
+                try:
+                    self._active.put_nowait(p)
+                except QueueFull:
+                    self._standby.put_nowait(p)
+            # 节点未通过检测，关闭该节点的进程
             else:
                 p.stop()
+
+        if self._active.qsize() == 0:
+            raise ProxyError('无可用节点')
+
+        # 启动恢复被禁用节点任务
+        self._recovery_task = create_task(self._recover())
         return self
 
     def stop(self) -> None:
         """关闭代理池"""
-        for p in self._all_proxies:
+        self._recovery_task.cancel()
+        for p in self._all:
             p.stop()
 
     async def __aenter__(self) -> Self:
@@ -153,6 +236,3 @@ class ProxyPool:
 
     async def __aexit__(self, et, ev, eb) -> bool | None:
         self.stop()
-
-    async def _test_proxies_available(self) -> None:
-        """每个一段时间从代理池中拿出部分节点检验代理有效性"""
