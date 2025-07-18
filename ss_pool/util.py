@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import re
-from asyncio import create_task, gather
+from asyncio import Semaphore, create_task, gather
 from base64 import b64decode
 from collections import defaultdict
-from typing import Collection
+from typing import TYPE_CHECKING, Collection
 from urllib.parse import unquote_plus
 
 from aiohttp import ClientSession, ClientTimeout
 
-from .core import Proxy
+if TYPE_CHECKING:
+    from .core import Proxy
 
 
 def group_by_location(*proxies: Proxy, default: str = 'UNKNOWN') -> dict[str, list[Proxy]]:
@@ -53,6 +54,8 @@ def from_base64(encoding: str, ignore: Collection[re.Pattern[str]] = DEFAULT_IGN
     - 剩余流量
     - 距离下次重置剩余
     """
+    from .core import Proxy
+
     result: set[Proxy] = set()  # 去除重复项
     for line in b64decode(encoding).decode().splitlines():
         if m := SS_URL.search(line):
@@ -104,13 +107,21 @@ async def test(proxy: Proxy, session: ClientSession | None = None, timeout: floa
 
 
 async def tests(
-    *proxies: Proxy, session: ClientSession | None = None, timeout: float = 30
+    *proxies: Proxy,
+    session: ClientSession | None = None,
+    timeout: float = 30,
+    semaphore: Semaphore | None = None,
 ) -> dict[Proxy, bool]:
     """并发测试多个节点的有效性"""
     result: dict[Proxy, bool] = dict()
+    # 限制 _run 的并发数
+    semaphore = semaphore if semaphore is not None else Semaphore(10)
 
-    async def _run(proxy: Proxy, session: ClientSession, timeout: float) -> tuple[Proxy, bool]:
-        return proxy, await test(proxy, session, timeout)
+    async def _run(
+        semaphore: Semaphore, proxy: Proxy, session: ClientSession, timeout: float
+    ) -> tuple[Proxy, bool]:
+        async with semaphore:
+            return proxy, await test(proxy, session, timeout)
 
     flag = False
     # session 为 None，就创建新 session，并在结束时关闭该新 session
@@ -119,7 +130,7 @@ async def tests(
         session = ClientSession()
 
     try:
-        tasks = [create_task(_run(p, session, timeout)) for p in proxies]
+        tasks = [create_task(_run(semaphore, p, session, timeout)) for p in proxies]
         for p, r in await gather(*tasks):
             result[p] = r
     finally:
