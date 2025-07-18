@@ -4,11 +4,11 @@ version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
     "aiohttp>=3.12.14",
-    "patchright>=1.52.5",
-    "playwright>=1.52.0",
+    "valkey[libvalkey]>=6.1.0",
 ]
 
 [dependency-groups]
 dev = [
-    "ipykernel>=6.29.5",
+    "patchright>=1.52.5",
+    "playwright>=1.53.0",
 ]
