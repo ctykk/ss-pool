@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import re
-from asyncio import Queue, Semaphore, Task, create_task, gather, sleep
+from asyncio import create_task, gather, sleep
 from asyncio.subprocess import DEVNULL, Process, create_subprocess_exec
 from base64 import b64decode
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from heapq import heappush
 from random import randint
-from typing import Any, AsyncGenerator, Final, Iterable, Self
+from typing import Any, AsyncGenerator, Collection, Final, Iterable, Self
 from urllib.parse import unquote_plus
 
 
@@ -26,8 +26,10 @@ class Proxy:
         self._encrypt_method: Final[str] = encrypt_method
         self._password: Final[str] = password
         self.name: Final[str] = name
+        """名称"""
 
         self.id: Final[tuple[str, int, str]]
+        """地区 | 线路 | 编号"""
         if m := re.search(r'(.*?)(\d+)线 \| ([A-Z])', self.name):
             self.id = (m.group(1), int(m.group(2)), m.group(3))
         else:
@@ -85,6 +87,7 @@ class Proxy:
     def stop(self) -> None:
         """关闭代理进程"""
         if self._process is not None:
+            # 节点尚未关闭
             if self._process.returncode is None:
                 self._process.terminate()
             self._process = None
@@ -93,7 +96,7 @@ class Proxy:
     @classmethod
     def from_base64(cls, encoding: str) -> list[Self]:
         """从 base64 中解析节点"""
-        result: list[Self] = list()
+        result: set[Self] = set()  # 去除重复项
         for line in b64decode(encoding).decode().splitlines():
             if m := re.search(r'^ss://([A-Za-z0-9]+)@([a-z0-9\.]+?\.com:\d{1,5})#(.*?)$', line):
                 encrypt_method, password = b64decode(m.group(1)).decode().split(':')
@@ -101,7 +104,7 @@ class Proxy:
                 name = unquote_plus(m.group(3))
                 if name.startswith('套餐到期') or name.startswith('剩余流量'):
                     continue
-                result.append(
+                result.add(
                     cls(
                         server_addr=server_addr,
                         encrypt_method=encrypt_method,
@@ -109,10 +112,10 @@ class Proxy:
                         name=name,
                     )
                 )
-        return result
+        return list(result)
 
     @classmethod
-    def groupby(cls, proxies: Iterable[Self]) -> dict[str, list[Self]]:
+    def split_group(cls, proxies: Iterable[Self]) -> dict[str, list[Self]]:
         """将若干节点按 id[0] 分组，各组内按 id[1], id[2] 排序"""
         result: dict[str, list[Self]] = defaultdict(list)
 
@@ -128,7 +131,10 @@ class Proxy:
         return f'name={self.name}, server_addr="{self._server_addr}"'
 
     def __hash__(self) -> int:
-        return hash(repr(self))
+        """server_addr encrypt_method password 都相同的两个实例是同一个节点"""
+        return hash(
+            f'{type(self).__name__}(server_addr="{self._server_addr}", encrypt_method="{self._encrypt_method}", password="{self._password}")'
+        )
 
     def __eq__(self, o: Any) -> bool:
         return isinstance(o, type(self)) and hash(self) == hash(o)
@@ -142,7 +148,7 @@ class Proxy:
 
 class ProxyPool:
     def __init__(
-        self, proxies: Iterable[Proxy], max_process: int = 5, recovery_delay: float = 60
+        self, proxies: Collection[Proxy], max_process: int = 5, recovery_delay: float = 60
     ) -> None:
         """
         :param max_process: 可同时使用的最大节点数
@@ -150,80 +156,58 @@ class ProxyPool:
         :param recovery_delay: 节点失效后的禁用时长（秒）
         :type recovery_delay: float
         """
-        self._max_process: int = max_process
-        self._semaphore: Semaphore = Semaphore(self._max_process)
         self._recovery_delay: float = recovery_delay
-
-        # 所有代理节点
+        self._max_process: int = min(max_process, len(proxies))
         self._all_proxies: list[Proxy] = list(proxies)
-        # 空闲代理队列（已启动的）
-        self._free_proxies: Queue[Proxy] = Queue()
-        # 恢复任务队列
-        self._recovery_tasks: Queue[Task] = Queue()
+        # TODO
 
     async def acquire(self) -> Proxy:
         """
         获取一个节点
 
+        ---
+
         - 一个节点不可同时被多处使用
-        - 阻塞，若已达到可同时使用的最大节点数
+        - 若当前已启动的节点数未达到上限，就启动可用节点直到上限
+        - 若当前暂无可用节点，就阻塞直到有可用节点
         """
-        await self._semaphore.acquire()
-        return await self._free_proxies.get()
+        # TODO
 
     def release(self, proxy: Proxy) -> None:
-        """释放一个节点（放回空闲队列）"""
-        self._free_proxies.put_nowait(proxy)
-        self._semaphore.release()
+        """释放一个节点"""
+        # TODO
 
     @asynccontextmanager
     async def use(self) -> AsyncGenerator[Proxy]:
-        """acquire + release 的异步上下文管理器"""
+        """acquire + release"""
         proxy = await self.acquire()
         try:
             yield proxy
         finally:
             self.release(proxy)
 
-    async def _recovery(self, proxy: Proxy) -> None:
-        """节点恢复流程：关闭→等待→重启→放回空闲队列"""
-        proxy.stop()
-        await sleep(self._recovery_delay)
-        try:
-            await proxy.start()
-            await self._free_proxies.put(proxy)
-        except ProxyError:
-            # 重启失败时放弃该节点
-            pass
-
     def mark_failure(self, proxy: Proxy) -> None:
-        """标记节点为失败状态（启动恢复流程）"""
-        recovery_task = create_task(self._recovery(proxy))
-        self._recovery_tasks.put_nowait(recovery_task)
+        """标记节点为失败状态（暂时禁用该节点）"""
+        # TODO
 
     async def start(self) -> None:
-        """启动初始代理进程（不超过最大进程数）"""
+        """初始化代理池"""
         # 启动至多 max_process 个代理
-        init_proxies = self._all_proxies[:self._max_process]
-        await gather(*(self._start_and_enqueue(p) for p in init_proxies))
+        init_proxies = self._all_proxies[: self._max_process]
+        await gather(*(self._start(p) for p in init_proxies))
 
-    async def _start_and_enqueue(self, proxy: Proxy) -> None:
-        """启动代理并放入空闲队列"""
+    async def _start(self, proxy: Proxy) -> None:
+        """启动一个节点"""
         try:
             await proxy.start()
-            await self._free_proxies.put(proxy)
+        # 启动失败时跳过该代理
         except ProxyError:
-            # 启动失败时跳过该代理
             pass
 
     def stop(self) -> None:
-        """停止所有代理进程"""
+        """关闭代理池"""
         for p in self._all_proxies:
             p.stop()
-        # 取消所有恢复任务
-        while not self._recovery_tasks.empty():
-            task = self._recovery_tasks.get_nowait()
-            task.cancel()
 
     async def __aenter__(self) -> Self:
         await self.start()
