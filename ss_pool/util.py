@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from asyncio import as_completed, create_task, gather
+from asyncio import create_task, gather
 from base64 import b64decode
 from collections import defaultdict
 from typing import Collection
@@ -33,10 +33,12 @@ def group_by_location(*proxies: Proxy, default: str = 'UNKNOWN') -> dict[str, li
     return result
 
 
+SS_URL: re.Pattern[str] = re.compile(r'^ss://([A-Za-z0-9]+)@([a-z0-9\.]+?\.com:\d{1,5})#(.*?)$')
+"""解析 ss 链接的正则表达式"""
 DEFAULT_IGNORE: tuple[re.Pattern[str], ...] = (
-    re.compile(r'^套餐到期'),
-    re.compile(r'剩余流量'),
-    re.compile(r'距离下次重置剩余'),
+    re.compile('套餐到期'),
+    re.compile('剩余流量'),
+    re.compile('距离下次重置剩余'),
 )
 """默认忽略的节点"""
 
@@ -53,15 +55,14 @@ def from_base64(encoding: str, ignore: Collection[re.Pattern[str]] = DEFAULT_IGN
     """
     result: set[Proxy] = set()  # 去除重复项
     for line in b64decode(encoding).decode().splitlines():
-        if m := re.search(r'^ss://([A-Za-z0-9]+)@([a-z0-9\.]+?\.com:\d{1,5})#(.*?)$', line):
-            encrypt_method, password = b64decode(m.group(1)).decode().split(':')
+        if m := SS_URL.search(line):
+            encrypt_method, password = b64decode(m.group(1)).decode().split(':', 1)
             server_addr = m.group(2)
             name = unquote_plus(m.group(3))
 
-            # 跳过
-            for pattern in ignore:
-                if pattern.search(name):
-                    continue
+            # 跳过忽略的节点
+            if any(pt.search(name) is not None for pt in ignore):
+                continue
 
             result.add(
                 Proxy(
