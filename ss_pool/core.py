@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import re
-from asyncio import create_task, gather, sleep
+from asyncio import sleep
 from asyncio.subprocess import DEVNULL, Process, create_subprocess_exec
 from base64 import b64decode
 from collections import defaultdict
-from contextlib import asynccontextmanager
 from heapq import heappush
 from random import randint
-from typing import Any, AsyncGenerator, Collection, Final, Iterable, Self
+from typing import Any, Final, Iterable, Self
 from urllib.parse import unquote_plus
+
+from aiohttp import ClientSession
 
 
 SSLOCAL = 'sslocal.exe'
+TEST_URL = 'http://ip-api.com/json'
 
 
 class ProxyError(Exception): ...
@@ -124,6 +126,27 @@ class Proxy:
 
         return result
 
+    async def test(self, session: ClientSession | None = None) -> bool:
+        """测试代理有效性"""
+        flag = False
+        # session 为 None，就创建新 session，并在方法结束时关闭该 session
+        if session is None:
+            flag = True
+            session = ClientSession()
+
+        try:
+            async with session.get(TEST_URL, proxy=self.url, raise_for_status=True) as resp:
+                # 若返回的 countryCode == CN 或在请求时出错了就返回 False
+                resp_json = await resp.json()
+                if resp_json['countryCode'] == 'CN':
+                    return False
+                return True
+        except Exception:
+            return False
+        finally:
+            if flag:
+                await session.close()
+
     def __repr__(self) -> str:
         return f'{type(self).__name__}(name="{self.name}", server_addr="{self._server_addr}", encrypt_method="{self._encrypt_method}", password="{self._password}")'
 
@@ -144,96 +167,3 @@ class Proxy:
 
     def __lt__(self, o: Self) -> bool:
         return self.id < o.id
-
-
-class ProxyPool:
-    def __init__(
-        self, proxies: Collection[Proxy], max_process: int = 5, recovery_delay: float = 60
-    ) -> None:
-        """
-        :param max_process: 可同时使用的最大节点数
-        :type max_process: int
-        :param recovery_delay: 节点失效后的禁用时长（秒）
-        :type recovery_delay: float
-        """
-        self._recovery_delay: float = recovery_delay
-        self._max_process: int = min(max_process, len(proxies))
-        self._all_proxies: list[Proxy] = list(proxies)
-        # TODO
-
-    async def acquire(self) -> Proxy:
-        """
-        获取一个节点
-
-        ---
-
-        - 一个节点不可同时被多处使用
-        - 若当前已启动的节点数未达到上限，就启动可用节点直到上限
-        - 若当前暂无可用节点，就阻塞直到有可用节点
-        """
-        # TODO
-
-    def release(self, proxy: Proxy) -> None:
-        """释放一个节点"""
-        # TODO
-
-    @asynccontextmanager
-    async def use(self) -> AsyncGenerator[Proxy]:
-        """acquire + release"""
-        proxy = await self.acquire()
-        try:
-            yield proxy
-        finally:
-            self.release(proxy)
-
-    def mark_failure(self, proxy: Proxy) -> None:
-        """标记节点为失败状态（暂时禁用该节点）"""
-        # TODO
-
-    async def start(self) -> None:
-        """初始化代理池"""
-        # 启动至多 max_process 个代理
-        init_proxies = self._all_proxies[: self._max_process]
-        await gather(*(self._start(p) for p in init_proxies))
-
-    async def _start(self, proxy: Proxy) -> None:
-        """启动一个节点"""
-        try:
-            await proxy.start()
-        # 启动失败时跳过该代理
-        except ProxyError:
-            pass
-
-    def stop(self) -> None:
-        """关闭代理池"""
-        for p in self._all_proxies:
-            p.stop()
-
-    async def __aenter__(self) -> Self:
-        await self.start()
-        return self
-
-    async def __aexit__(self, et, ev, eb) -> bool | None:
-        self.stop()
-        return None
-
-
-if __name__ == '__main__':
-    """测试"""
-    from asyncio import run
-    from aiohttp import ClientSession
-
-    async def worker(pool: ProxyPool, wid: str) -> None:
-        async with pool.use() as proxy:
-            print(f'[{wid}] 使用代理 {proxy.name}')
-            async with ClientSession(proxy=proxy.url) as session:
-                async with session.get('http://ip-api.com/json') as resp:
-                    print(f'[{wid}]', proxy.name, await resp.text())
-
-    async def main() -> None:
-        with open('temp/7c151fe3.txt', 'r') as fp:
-            async with ProxyPool(Proxy.from_base64(fp.read()), max_process=5) as pool:
-                workers = [create_task(worker(pool, str(_ + 1))) for _ in range(10)]
-                await gather(*workers)
-
-    run(main())
