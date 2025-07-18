@@ -4,7 +4,6 @@ version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
     "aiohttp>=3.12.14",
-    "valkey[libvalkey]>=6.1.0",
 ]
 
 [dependency-groups]
