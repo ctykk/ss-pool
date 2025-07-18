@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-from asyncio import Queue, Semaphore, Task, create_task, gather, get_running_loop, run, sleep
+import re
+from asyncio import Queue, Semaphore, Task, create_task, gather, sleep
 from asyncio.subprocess import DEVNULL, Process, create_subprocess_exec
+from base64 import b64decode
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from heapq import heappush
 from random import randint
-from typing import Iterable, Self
+from typing import Any, AsyncGenerator, Final, Iterable, Self
+from urllib.parse import unquote_plus
 
 
 SSLOCAL = 'sslocal.exe'
@@ -13,11 +19,19 @@ class ProxyError(Exception): ...
 
 
 class Proxy:
-    def __init__(self, server_addr: str, encrypt_method: str, password: str, name: str = '') -> None:
-        self._server_addr: str = server_addr
-        self._encrypt_method: str = encrypt_method
-        self._password: str = password
-        self.name: str = name
+    def __init__(
+        self, server_addr: str, encrypt_method: str, password: str, name: str = 'UNKNOWN'
+    ) -> None:
+        self._server_addr: Final[str] = server_addr
+        self._encrypt_method: Final[str] = encrypt_method
+        self._password: Final[str] = password
+        self.name: Final[str] = name
+
+        self.id: Final[tuple[str, int, str]]
+        if m := re.search(r'(.*?)(\d+)线 \| ([A-Z])', self.name):
+            self.id = (m.group(1), int(m.group(2)), m.group(3))
+        else:
+            self.id = ('UNKNOWN', -1, 'UNKNOWN')
 
         self._process: Process | None = None
         self._port: int | None = None
@@ -76,6 +90,55 @@ class Proxy:
             self._process = None
         self._port = None
 
+    @classmethod
+    def from_base64(cls, encoding: str) -> list[Self]:
+        """从 base64 中解析节点"""
+        result: list[Self] = list()
+        for line in b64decode(encoding).decode().splitlines():
+            if m := re.search(r'^ss://([A-Za-z0-9]+)@([a-z0-9\.]+?\.com:\d{1,5})#(.*?)$', line):
+                encrypt_method, password = b64decode(m.group(1)).decode().split(':')
+                server_addr = m.group(2)
+                name = unquote_plus(m.group(3))
+                if name.startswith('套餐到期') or name.startswith('剩余流量'):
+                    continue
+                result.append(
+                    cls(
+                        server_addr=server_addr,
+                        encrypt_method=encrypt_method,
+                        password=password,
+                        name=name,
+                    )
+                )
+        return result
+
+    @classmethod
+    def groupby(cls, proxies: Iterable[Self]) -> dict[str, list[Self]]:
+        """将若干节点按 id[0] 分组，各组内按 id[1], id[2] 排序"""
+        result: dict[str, list[Self]] = defaultdict(list)
+
+        for p in proxies:
+            heappush(result[p.id[0]], p)
+
+        return result
+
+    def __repr__(self) -> str:
+        return f'{type(self).__name__}(name="{self.name}", server_addr="{self._server_addr}", encrypt_method="{self._encrypt_method}", password="{self._password}")'
+
+    def __str__(self) -> str:
+        return f'name={self.name}, server_addr="{self._server_addr}"'
+
+    def __hash__(self) -> int:
+        return hash(repr(self))
+
+    def __eq__(self, o: Any) -> bool:
+        return isinstance(o, type(self)) and hash(self) == hash(o)
+
+    def __gt__(self, o: Self) -> bool:
+        return self.id > o.id
+
+    def __lt__(self, o: Self) -> bool:
+        return self.id < o.id
+
 
 class ProxyPool:
     # TODO
@@ -93,7 +156,7 @@ class ProxyPool:
         self._semaphore: Semaphore = Semaphore(self._max_process)
         self._recovery_delay: float = recovery_delay
 
-        # NOTICE 优先使用已启动的节点，当节点被禁用时才启动新节点
+        # NOTICE 优先使用已启动节点，当已启动节点被禁用时才启动新节点
 
         self._all_proxies: list[Proxy] = list(proxies)  # 总的节点列表
         self._free_proxies: Queue[Proxy] = Queue()  # 空闲的节点
@@ -114,6 +177,15 @@ class ProxyPool:
         self._free_proxies.put_nowait(proxy)
         self._semaphore.release()
 
+    @asynccontextmanager
+    async def use(self) -> AsyncGenerator[Proxy]:
+        """acquire + release"""
+        proxy = await self.acquire()
+        try:
+            yield proxy
+        finally:
+            self.release(proxy)
+
     async def _recovery(self, proxy: Proxy) -> None:
         """关闭节点，等待一会后重新启动它"""
         proxy.stop()
@@ -126,7 +198,7 @@ class ProxyPool:
         self._recovery_tasks.put_nowait(_)
 
     async def start(self) -> None:
-        """启动 max_process 个代理进程"""
+        """启动至多 max_process 个代理进程"""
         await gather(*(self._start_and_enqueue(p) for p in self._all_proxies[: self._max_process]))
 
     async def _start_and_enqueue(self, proxy: Proxy) -> None:
@@ -146,15 +218,21 @@ class ProxyPool:
 
 
 if __name__ == '__main__':
+    """测试"""
+    from asyncio import run
+    from aiohttp import ClientSession
 
-    async def main():
-        async with ProxyPool(
-            [
-                Proxy('', '', ''),
-                Proxy('', '', ''),
-                Proxy('', '', ''),
-            ]
-        ) as pool:
-            pass
+    async def worker(pool: ProxyPool, wid: str) -> None:
+        async with pool.use() as proxy:
+            print(f'[{wid}] 使用代理 {proxy.name}')
+            async with ClientSession(proxy=proxy.url) as session:
+                async with session.get('http://ip-api.com/json') as resp:
+                    print(f'[{wid}]', proxy.name, await resp.text())
+
+    async def main() -> None:
+        with open('temp/7c151fe3.txt', 'r') as fp:
+            async with ProxyPool(Proxy.from_base64(fp.read()), max_process=5) as pool:
+                workers = [create_task(worker(pool, str(_ + 1))) for _ in range(10)]
+                await gather(*workers)
 
     run(main())
