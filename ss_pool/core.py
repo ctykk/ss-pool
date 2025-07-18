@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from asyncio import sleep
+from asyncio import Queue, gather, sleep
 from asyncio.subprocess import DEVNULL, Process, create_subprocess_exec
+from contextlib import asynccontextmanager
 from random import randint
-from typing import Any, Final
+from typing import Any, AsyncGenerator, Collection, Final, Self
+
+from .util import tests
 
 
 SSLOCAL = 'sslocal.exe'
@@ -93,3 +96,63 @@ class Proxy:
 
     def __eq__(self, o: Any) -> bool:
         return isinstance(o, type(self)) and hash(self) == hash(o)
+
+
+class ProxyPool:
+    """网络代理池"""
+
+    """
+    TODO
+    - 代理中途失效时如何暂时禁用它？
+    - 代理过了禁用时间后如何恢复它？
+    - 如何限制同时启动的最大节点数？（只启动这么多个节点，其余的节点作为当前已启动节点被禁用后的备胎）
+    """
+
+    def __init__(self, proxies: Collection[Proxy]) -> None:
+        self._all_proxies: list[Proxy] = list(set(proxies))  # 所有节点（去重）
+        self._available_proxies: Queue[Proxy] = Queue()  # 可用的节点
+
+    async def acquire(self) -> Proxy:
+        """获取一个节点"""
+        return await self._available_proxies.get()
+
+    def release(self, proxy: Proxy) -> None:
+        """释放一个节点"""
+        self._available_proxies.put_nowait(proxy)
+
+    @asynccontextmanager
+    async def get(self) -> AsyncGenerator[Proxy]:
+        proxy = await self.acquire()
+        try:
+            yield proxy
+        finally:
+            self.release(proxy)
+
+    async def start(self) -> Self:
+        """启动代理池"""
+        # 启动所有节点
+        await gather(*[p.start() for p in self._all_proxies])
+        # 测试所有节点的有效性
+        proxy_status = await tests(*self._all_proxies, timeout=10)
+        # 去除所有无效节点
+        for p, s in proxy_status.items():
+            # 节点通过检测
+            if s:
+                self._available_proxies.put_nowait(p)
+            else:
+                p.stop()
+        return self
+
+    def stop(self) -> None:
+        """关闭代理池"""
+        for p in self._all_proxies:
+            p.stop()
+
+    async def __aenter__(self) -> Self:
+        return await self.start()
+
+    async def __aexit__(self, et, ev, eb) -> bool | None:
+        self.stop()
+
+    async def _test_proxies_available(self) -> None:
+        """每个一段时间从代理池中拿出部分节点检验代理有效性"""
