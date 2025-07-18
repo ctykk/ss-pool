@@ -76,11 +76,11 @@ def from_base64(encoding: str, ignore: Collection[re.Pattern[str]] = DEFAULT_IGN
 
 
 TEST_URL: str = 'http://ip-api.com/json'
-"""测试代理有效性的接口"""
+"""测试节点有效性的接口"""
 
 
 async def test(proxy: Proxy, session: ClientSession | None = None, timeout: float = 30) -> bool:
-    """测试代理有效性"""
+    """测试节点有效性"""
     flag = False
     # session 为 None，就创建新 session，并在结束时关闭该新 session
     if session is None:
@@ -106,7 +106,7 @@ async def test(proxy: Proxy, session: ClientSession | None = None, timeout: floa
 async def tests(
     *proxies: Proxy, session: ClientSession | None = None, timeout: float = 30
 ) -> dict[Proxy, bool]:
-    """并发测试多个代理的有效性"""
+    """并发测试多个节点的有效性"""
     result: dict[Proxy, bool] = dict()
 
     async def _run(proxy: Proxy, session: ClientSession, timeout: float) -> tuple[Proxy, bool]:
