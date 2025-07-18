@@ -141,7 +141,6 @@ class Proxy:
 
 
 class ProxyPool:
-    # TODO
     def __init__(
         self, proxies: Iterable[Proxy], max_process: int = 5, recovery_delay: float = 60
     ) -> None:
@@ -151,15 +150,15 @@ class ProxyPool:
         :param recovery_delay: 节点失效后的禁用时长（秒）
         :type recovery_delay: float
         """
-        # 限制可同时使用的最大节点数
         self._max_process: int = max_process
         self._semaphore: Semaphore = Semaphore(self._max_process)
         self._recovery_delay: float = recovery_delay
 
-        # NOTICE 优先使用已启动节点，当已启动节点被禁用时才启动新节点
-
-        self._all_proxies: list[Proxy] = list(proxies)  # 总的节点列表
-        self._free_proxies: Queue[Proxy] = Queue()  # 空闲的节点
+        # 所有代理节点
+        self._all_proxies: list[Proxy] = list(proxies)
+        # 空闲代理队列（已启动的）
+        self._free_proxies: Queue[Proxy] = Queue()
+        # 恢复任务队列
         self._recovery_tasks: Queue[Task] = Queue()
 
     async def acquire(self) -> Proxy:
@@ -173,13 +172,13 @@ class ProxyPool:
         return await self._free_proxies.get()
 
     def release(self, proxy: Proxy) -> None:
-        """释放一个节点"""
+        """释放一个节点（放回空闲队列）"""
         self._free_proxies.put_nowait(proxy)
         self._semaphore.release()
 
     @asynccontextmanager
     async def use(self) -> AsyncGenerator[Proxy]:
-        """acquire + release"""
+        """acquire + release 的异步上下文管理器"""
         proxy = await self.acquire()
         try:
             yield proxy
@@ -187,27 +186,44 @@ class ProxyPool:
             self.release(proxy)
 
     async def _recovery(self, proxy: Proxy) -> None:
-        """关闭节点，等待一会后重新启动它"""
+        """节点恢复流程：关闭→等待→重启→放回空闲队列"""
         proxy.stop()
         await sleep(self._recovery_delay)
-        await self._start_and_enqueue(proxy)
+        try:
+            await proxy.start()
+            await self._free_proxies.put(proxy)
+        except ProxyError:
+            # 重启失败时放弃该节点
+            pass
 
     def mark_failure(self, proxy: Proxy) -> None:
-        """标注一个节点为不可用"""
-        _ = create_task(self._recovery(proxy))
-        self._recovery_tasks.put_nowait(_)
+        """标记节点为失败状态（启动恢复流程）"""
+        recovery_task = create_task(self._recovery(proxy))
+        self._recovery_tasks.put_nowait(recovery_task)
 
     async def start(self) -> None:
-        """启动至多 max_process 个代理进程"""
-        await gather(*(self._start_and_enqueue(p) for p in self._all_proxies[: self._max_process]))
+        """启动初始代理进程（不超过最大进程数）"""
+        # 启动至多 max_process 个代理
+        init_proxies = self._all_proxies[:self._max_process]
+        await gather(*(self._start_and_enqueue(p) for p in init_proxies))
 
     async def _start_and_enqueue(self, proxy: Proxy) -> None:
-        await proxy.start()
-        await self._free_proxies.put(proxy)
+        """启动代理并放入空闲队列"""
+        try:
+            await proxy.start()
+            await self._free_proxies.put(proxy)
+        except ProxyError:
+            # 启动失败时跳过该代理
+            pass
 
     def stop(self) -> None:
+        """停止所有代理进程"""
         for p in self._all_proxies:
             p.stop()
+        # 取消所有恢复任务
+        while not self._recovery_tasks.empty():
+            task = self._recovery_tasks.get_nowait()
+            task.cancel()
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -215,6 +231,7 @@ class ProxyPool:
 
     async def __aexit__(self, et, ev, eb) -> bool | None:
         self.stop()
+        return None
 
 
 if __name__ == '__main__':
