@@ -2,9 +2,7 @@
 name = "ss-pool"
 version = "0.1.0"
 requires-python = ">=3.13"
-dependencies = [
-    "aiohttp>=3.12.14",
-]
+dependencies = ["aiohttp>=3.12.14"]
 
 [dependency-groups]
 dev = [
@@ -13,3 +11,6 @@ dev = [
     "patchright>=1.52.5",
     "playwright>=1.53.0",
 ]
+
+[tool.setuptools]
+packages = ["ss_pool"]
