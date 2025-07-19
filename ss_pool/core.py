@@ -6,11 +6,9 @@ from contextlib import asynccontextmanager
 from random import randint
 from time import monotonic
 from typing import Any, AsyncGenerator, Collection, Final, Self
+from weakref import finalize
 
 from .util import tests
-
-
-SSLOCAL = 'sslocal.exe'
 
 
 class ProxyError(Exception): ...
@@ -27,6 +25,9 @@ class Proxy:
 
         self._process: Process | None = None
         self._port: int | None = None
+
+        # NOTICE 可能会出现先是手动调用 stop，然后又因为实例被销毁而二次调用 stop 的情况
+        self._finalizer = finalize(self, Proxy.stop, self)  # 实例被销毁时调用 stop
 
     @property
     def url(self) -> str:
@@ -61,7 +62,7 @@ class Proxy:
             return
 
         process = await create_subprocess_exec(
-            SSLOCAL,
+            'sslocal.exe',
             '-b',
             f'localhost:{port}',
             '-s',
@@ -119,16 +120,22 @@ class ProxyPool:
     """
 
     def __init__(
-        self, proxies: Collection[Proxy], max_acquire: int = 0, disable_until: float = 60
+        self,
+        proxies: Collection[Proxy],
+        max_acquire: int = 0,
+        disable_until: float = 60,
+        test_timeout: float = 10,
     ) -> None:
         """
         :param max_acquire: 同时能使用的最大节点数（小于等于 0 为无限制）
         :param disable_until: 节点禁用持续时间（秒）
+        :param test_timeout: 测试节点可用性的超时时间
         """
         self._enable_sem: bool = max_acquire > 0  # 是否启用 acquire_sem
         if self._enable_sem:
             self._acquire_sem = Semaphore(max_acquire)  # 限制同时能使用的最大节点数
         self._disable_until: float = disable_until
+        self._test_timeout: float = test_timeout
 
         self._all: list[Proxy] = list(set(proxies))  # 所有节点（去重）
         self._active: Queue[Proxy] = Queue(maxsize=max_acquire)  # 激活的节点
@@ -212,7 +219,7 @@ class ProxyPool:
         # 启动所有节点
         await gather(*[p.start() for p in self._all])
         # 测试所有节点的有效性
-        proxy_status = await tests(*self._all, timeout=10)
+        proxy_status = await tests(*self._all, timeout=self._test_timeout)
         for p, s in proxy_status.items():
             # 节点通过检测，将节点放入 active，active 已满就放到 standby
             if s:
@@ -233,7 +240,10 @@ class ProxyPool:
 
     def stop(self) -> None:
         """关闭代理池"""
-        self._recovery_task.cancel()
+        # 取消恢复任务
+        if t := getattr(self, '_recovery_task', None):
+            t.cancel()
+        # 关闭所有节点
         for p in self._all:
             p.stop()
 
