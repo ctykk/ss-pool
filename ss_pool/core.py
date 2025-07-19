@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from asyncio import CancelledError, Queue, QueueFull, Semaphore, create_task, gather, sleep
+from asyncio import CancelledError, Queue, QueueEmpty, QueueFull, Semaphore, create_task, gather, sleep
 from asyncio.subprocess import DEVNULL, Process, create_subprocess_exec
 from contextlib import asynccontextmanager
 from random import randint
 from time import monotonic
 from typing import Any, AsyncGenerator, Collection, Final, Self
+
+from loguru import logger
 
 from .util import tests
 
@@ -96,7 +98,7 @@ class Proxy:
         return f'{type(self).__name__}(name="{self.name}", server_addr="{self._server_addr}", encrypt_method="{self._encrypt_method}", password="{self._password}")'
 
     def __str__(self) -> str:
-        return f'name={self.name}, server_addr="{self._server_addr}"'
+        return f'name="{self.name}", server_addr="{self._server_addr}"'
 
     def __hash__(self) -> int:
         """server_addr encrypt_method password 都相同的两个实例是同一个节点"""
@@ -112,67 +114,85 @@ class ProxyPool:
     """网络代理池"""
 
     """
-    # TODO
+    # NOTICE
     - 节点中途失效时如何暂时禁用它？（因不同调用方的实现判定不同，是否需要禁用由调用方判定）
     - 节点过了禁用时间后如何恢复它？
     - 如何限制同时使用的最大节点数？（只启动这么多个节点，其余的节点作为当前使用节点被禁用后的备胎）
     """
 
     def __init__(
-        self, proxies: Collection[Proxy], max_active: int = 0, disable_until: float = 60
+        self, proxies: Collection[Proxy], max_acquire: int = 0, disable_until: float = 60
     ) -> None:
         """
-        :param max_active: 同时能使用的最大节点数（小于等于 0 为无限制）
+        :param max_acquire: 同时能使用的最大节点数（小于等于 0 为无限制）
         :param disable_until: 节点禁用持续时间（秒）
         """
-        self._max_active = max_active
-        self._max_active_sem = Semaphore(self._max_active)  # 限制同时能使用的最大节点数
+        self._enable_sem: bool = max_acquire > 0  # 是否启用 acquire_sem
+        if self._enable_sem:
+            self._acquire_sem = Semaphore(max_acquire)  # 限制同时能使用的最大节点数
         self._disable_until: float = disable_until
 
         self._all: list[Proxy] = list(set(proxies))  # 所有节点（去重）
-        self._active: Queue[Proxy] = Queue(maxsize=self._max_active)  # 激活的节点
+        self._active: Queue[Proxy] = Queue(maxsize=max_acquire)  # 激活的节点
         self._standby: Queue[Proxy] = Queue()  # 后备节点
         self._disabled: dict[Proxy, float] = dict()  # 被禁用节点与其禁用到期时间
 
     async def acquire(self) -> Proxy:
         """获取一个节点"""
         # 持续从 active 中获取节点，直到找到为未被禁用的节点
-        await self._max_active_sem.acquire()
+        if self._enable_sem:
+            await self._acquire_sem.acquire()
 
-        while True:
-            # 从 active 获取节点，若 active 已空从 standby 获取
-            if self._active.empty():
-                proxy = await self._standby.get()
-            else:
-                proxy = await self._active.get()
+        # 从 active 获取节点，若 active 已空从 standby 获取
+        try:
+            logger.debug('尝试获取 active 节点')
+            proxy = self._active.get_nowait()
+            logger.debug(f'成功获取 active 节点 {proxy}')
+        except QueueEmpty:
+            logger.debug('无 active 节点，尝试获取 standby 节点')
+            proxy = await self._standby.get()
+            logger.debug(f'成功获取 standby 节点 {proxy}')
 
-            # 如果节点未被禁用就使用该节点
-            if proxy not in self._disabled:
-                break
-
-            # TODO 如果 active 和 standby 都没有可用节点，会陷入死循环持续占用 CPU 吗？
-            self._standby.put_nowait(proxy)
+        # 如果节点被禁用就等待禁用结束（standby 的队头应当为最久未被使用的节点）
+        if self._is_disabled(proxy):
+            delay = round(self._disabled[proxy] - monotonic(), 2)
+            logger.debug(f'节点已被禁用，休眠 {delay} 秒 {proxy}')
+            # await sleep(self._disabled[proxy] - monotonic())
+            await sleep(delay)
+            logger.debug(f'休眠结束 {proxy}')
+            if proxy in self._disabled:
+                self._disabled.pop(proxy)
 
         # 节点未启动就启动它
         if not proxy.is_started():
+            logger.debug(f'启动节点 {proxy}')
             await proxy.start()
 
         return proxy
 
     def release(self, proxy: Proxy) -> None:
         """释放一个节点"""
-        # 节点仍处于禁用状态，就关闭其进程
-        if proxy in self._disabled and self._disabled[proxy] > monotonic():
+        # 节点仍处于禁用状态，就关闭其进程，并放回 standby
+        if self._is_disabled(proxy):
+            logger.debug(f'关闭已禁用节点 {proxy}')
             proxy.stop()
+            logger.debug(f'尝试将已禁用节点放入 standby {proxy}')
+            self._standby.put_nowait(proxy)
+            logger.debug(f'成功将已禁用节点放入 standby {proxy}')
             return
 
         # 节点仍可用，将节点放回 active，active 已满就放到 standby
         try:
+            logger.debug(f'尝试放回 active 节点 {proxy}')
             self._active.put_nowait(proxy)
+            logger.debug(f'成功放回 active 节点 {proxy}')
         except QueueFull:
+            logger.debug(f'active 已满，尝试放回 standby 节点 {proxy}')
             self._standby.put_nowait(proxy)
+            logger.debug(f'成功放回 standby 节点 {proxy}')
 
-        self._max_active_sem.release()
+        if self._enable_sem:
+            self._acquire_sem.release()
 
     @asynccontextmanager
     async def get(self) -> AsyncGenerator[Proxy]:
@@ -187,6 +207,10 @@ class ProxyPool:
         """禁用该节点"""
         self._disabled[proxy] = monotonic() + self._disable_until
 
+    def _is_disabled(self, proxy: Proxy) -> bool:
+        """节点是否处于禁用状态"""
+        return proxy in self._disabled and self._disabled[proxy] > monotonic()
+
     async def _recover(self) -> None:
         """恢复任务"""
         while True:
@@ -194,6 +218,7 @@ class ProxyPool:
             now = monotonic()
             recoverable = (p for p, t in self._disabled.items() if t < now)
             for p in recoverable:
+                logger.debug(f'恢复节点 {p}')
                 self._disabled.pop(p)
 
             try:
