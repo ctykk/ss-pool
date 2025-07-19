@@ -7,8 +7,6 @@ from random import randint
 from time import monotonic
 from typing import Any, AsyncGenerator, Collection, Final, Self
 
-from loguru import logger
-
 from .util import tests
 
 
@@ -145,27 +143,18 @@ class ProxyPool:
 
         # 从 active 获取节点，若 active 已空从 standby 获取
         try:
-            logger.debug('尝试获取 active 节点')
             proxy = self._active.get_nowait()
-            logger.debug(f'成功获取 active 节点 {proxy}')
         except QueueEmpty:
-            logger.debug('无 active 节点，尝试获取 standby 节点')
             proxy = await self._standby.get()
-            logger.debug(f'成功获取 standby 节点 {proxy}')
 
         # 如果节点被禁用就等待禁用结束（standby 的队头应当为最久未被使用的节点）
         if self._is_disabled(proxy):
-            delay = round(self._disabled[proxy] - monotonic(), 2)
-            logger.debug(f'节点已被禁用，休眠 {delay} 秒 {proxy}')
-            # await sleep(self._disabled[proxy] - monotonic())
-            await sleep(delay)
-            logger.debug(f'休眠结束 {proxy}')
+            await sleep(self._disabled[proxy] - monotonic())
             if proxy in self._disabled:
                 self._disabled.pop(proxy)
 
         # 节点未启动就启动它
         if not proxy.is_started():
-            logger.debug(f'启动节点 {proxy}')
             await proxy.start()
 
         return proxy
@@ -174,22 +163,15 @@ class ProxyPool:
         """释放一个节点"""
         # 节点仍处于禁用状态，就关闭其进程，并放回 standby
         if self._is_disabled(proxy):
-            logger.debug(f'关闭已禁用节点 {proxy}')
             proxy.stop()
-            logger.debug(f'尝试将已禁用节点放入 standby {proxy}')
             self._standby.put_nowait(proxy)
-            logger.debug(f'成功将已禁用节点放入 standby {proxy}')
             return
 
         # 节点仍可用，将节点放回 active，active 已满就放到 standby
         try:
-            logger.debug(f'尝试放回 active 节点 {proxy}')
             self._active.put_nowait(proxy)
-            logger.debug(f'成功放回 active 节点 {proxy}')
         except QueueFull:
-            logger.debug(f'active 已满，尝试放回 standby 节点 {proxy}')
             self._standby.put_nowait(proxy)
-            logger.debug(f'成功放回 standby 节点 {proxy}')
 
         if self._enable_sem:
             self._acquire_sem.release()
@@ -218,7 +200,6 @@ class ProxyPool:
             now = monotonic()
             recoverable = (p for p, t in self._disabled.items() if t < now)
             for p in recoverable:
-                logger.debug(f'恢复节点 {p}')
                 self._disabled.pop(p)
 
             try:
