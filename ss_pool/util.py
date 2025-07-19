@@ -78,11 +78,7 @@ def from_base64(encoding: str, ignore: Collection[re.Pattern[str]] = DEFAULT_IGN
     return list(result)
 
 
-TEST_URL: str = 'http://ip-api.com/json'
-"""测试节点有效性的接口"""
-
-
-async def test(proxy: Proxy, session: ClientSession | None = None, timeout: float = 30) -> bool:
+async def test(proxy: Proxy, session: ClientSession | None = None, timeout: float = 10) -> bool:
     """测试节点有效性"""
     flag = False
     # session 为 None，就创建新 session，并在结束时关闭该新 session
@@ -92,7 +88,10 @@ async def test(proxy: Proxy, session: ClientSession | None = None, timeout: floa
 
     try:
         async with session.get(
-            TEST_URL, proxy=proxy.url, timeout=ClientTimeout(timeout), raise_for_status=True
+            url='http://ip-api.com/json',
+            proxy=proxy.url,
+            timeout=ClientTimeout(timeout),
+            raise_for_status=True,
         ) as resp:
             # 若返回的 countryCode == CN 或在请求时出错了就返回 False
             resp_json = await resp.json()
@@ -109,7 +108,7 @@ async def test(proxy: Proxy, session: ClientSession | None = None, timeout: floa
 async def tests(
     *proxies: Proxy,
     session: ClientSession | None = None,
-    timeout: float = 30,
+    timeout: float = 10,
     semaphore: Semaphore | None = None,
 ) -> dict[Proxy, bool]:
     """并发测试多个节点的有效性"""
@@ -121,7 +120,7 @@ async def tests(
         semaphore: Semaphore, proxy: Proxy, session: ClientSession, timeout: float
     ) -> tuple[Proxy, bool]:
         async with semaphore:
-            return proxy, await test(proxy, session, timeout)
+            return proxy, await test(proxy=proxy, session=session, timeout=timeout)
 
     flag = False
     # session 为 None，就创建新 session，并在结束时关闭该新 session
