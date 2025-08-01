@@ -3,6 +3,7 @@ from __future__ import annotations
 from asyncio import CancelledError, Queue, QueueEmpty, QueueFull, Semaphore, create_task, gather, sleep
 from asyncio.subprocess import DEVNULL, Process, create_subprocess_exec
 from contextlib import asynccontextmanager
+from pathlib import Path
 from random import randint
 from time import monotonic
 from typing import Any, AsyncGenerator, Collection, Final, Self
@@ -44,24 +45,29 @@ class Proxy:
         """节点是否启动"""
         return self._process is not None and self._process.returncode is None
 
-    async def start(self, port: int | None = None) -> None:
+    async def start(self, port: int | None = None, acl: str | Path | None = None) -> None:
         """
         启动节点，如果给定端口则仅尝试一次，否则随机尝试直到成功
 
         :raises ProxyError: 传入了端口且端口不可用
+        :raises FileNotFoundError: 传入了 acl 但对应文件不存在
+        :raises IsADirectoryError: 传入了 acl 但对应路径为文件
         """
         while True:
             try:
-                return await self._start(randint(10000, 60000) if port is None else port)
+                return await self._start(
+                    randint(10000, 60000) if port is None else port,
+                    acl=Path(acl) if isinstance(acl, str) else acl,
+                )
             except ProxyError:
                 if port is not None:
                     raise
 
-    async def _start(self, port: int) -> None:
+    async def _start(self, port: int, acl: Path | None) -> None:
         if self.is_started():
             return
 
-        process = await create_subprocess_exec(
+        cmd = (
             'sslocal.exe',
             '-b',
             f'localhost:{port}',
@@ -71,6 +77,17 @@ class Proxy:
             self._encrypt_method,
             '-k',
             self._password,
+        )
+        # 添加 acl 支持
+        if acl is not None:
+            if not acl.exists():
+                raise FileNotFoundError(acl)
+            if not acl.is_file():
+                raise IsADirectoryError(acl)
+            cmd = cmd + ('--acl', str(acl))
+
+        process = await create_subprocess_exec(
+            *cmd,
             stderr=DEVNULL,
             stdout=DEVNULL,
         )
@@ -125,12 +142,16 @@ class ProxyPool:
         max_acquire: int = 0,
         disable_until: float = 60,
         test_timeout: float = 10,
+        acl: str | Path | None = None,
     ) -> None:
         """
         :param max_acquire: 同时能使用的最大节点数（小于等于 0 为无限制）
         :param disable_until: 节点禁用持续时间（秒）
         :param test_timeout: 测试节点可用性的超时时间
+        :param acl: 路由配置
         """
+        self._acl = acl
+
         self._enable_sem: bool = max_acquire > 0  # 是否启用 acquire_sem
         if self._enable_sem:
             self._acquire_sem = Semaphore(max_acquire)  # 限制同时能使用的最大节点数
@@ -162,7 +183,7 @@ class ProxyPool:
 
         # 节点未启动就启动它
         if not proxy.is_started():
-            await proxy.start()
+            await proxy.start(acl=self._acl)
 
         return proxy
 
@@ -178,6 +199,7 @@ class ProxyPool:
         try:
             self._active.put_nowait(proxy)
         except QueueFull:
+            proxy.stop()
             self._standby.put_nowait(proxy)
 
         if self._enable_sem:
@@ -217,7 +239,7 @@ class ProxyPool:
     async def start(self) -> Self:
         """启动代理池"""
         # 启动所有节点
-        await gather(*[p.start() for p in self._all])
+        await gather(*[p.start(acl=self._acl) for p in self._all])
         # 测试所有节点的有效性
         proxy_status = await tests(*self._all, timeout=self._test_timeout)
         for p, s in proxy_status.items():
@@ -226,6 +248,7 @@ class ProxyPool:
                 try:
                     self._active.put_nowait(p)
                 except QueueFull:
+                    p.stop()
                     self._standby.put_nowait(p)
             # 节点未通过检测，关闭该节点的进程
             else:
@@ -252,3 +275,7 @@ class ProxyPool:
 
     async def __aexit__(self, et, ev, eb) -> bool | None:
         self.stop()
+
+    def count(self) -> int:
+        """节点总数 (_active + _standby)"""
+        return self._active.qsize() + self._standby.qsize()
