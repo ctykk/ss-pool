@@ -18,7 +18,7 @@ async def main() -> None:
         """从代理池中获取代理看看能否访问"""
         # 成功就返回，失败就拿出下一节点重试
         while True:
-            async with pool.get() as proxy:
+            async with pool.use() as proxy:
                 PROXY_HISTORY[proxy.name] += 1
                 try:
                     # 非香港的节点都应失败
@@ -32,7 +32,7 @@ async def main() -> None:
                     logger.error(f'{proxy} {type(e).__name__}({e})')
                     pool.disable(proxy)
 
-    async with ProxyPool(proxies, max_acquire=0, disable_until=5) as pool:
+    async with ProxyPool(proxies) as pool:
         async with ClientSession(cookie_jar=DummyCookieJar()) as session:
             await gather(*[fetch(session, pool) for _ in range(300)])
 
