@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
-from asyncio import Semaphore, create_task, gather
+from abc import abstractmethod
+from asyncio import Queue, Semaphore, create_task, gather
 from base64 import b64decode
 from collections import defaultdict
-from typing import TYPE_CHECKING, Collection
+from heapq import heappop, heappush
+from typing import TYPE_CHECKING, Callable, Collection, Generic, Protocol, TypeVar, runtime_checkable
 from urllib.parse import unquote_plus
 
 from aiohttp import ClientSession, ClientTimeout
@@ -13,7 +15,9 @@ if TYPE_CHECKING:
     from .core import Proxy
 
 
-def group_by_location(*proxies: Proxy, default: str = 'UNKNOWN') -> dict[str, list[Proxy]]:
+def group_by_location(
+    proxies: Collection[Proxy], default: str = 'UNKNOWN'
+) -> defaultdict[str, list[Proxy]]:
     """按地区为节点分组
 
     :param default: 匹配不到地区时的组
@@ -22,7 +26,7 @@ def group_by_location(*proxies: Proxy, default: str = 'UNKNOWN') -> dict[str, li
     if len(proxies) == 0:
         raise ValueError('len(proxies) == 0')
 
-    result: dict[str, list[Proxy]] = defaultdict(list)
+    result: defaultdict[str, list[Proxy]] = defaultdict(list)
 
     for p in proxies:
         if m := re.search(r'(.*?)\d+线 \| [A-Z]', p.name):
@@ -40,6 +44,7 @@ DEFAULT_IGNORE: tuple[re.Pattern[str], ...] = (
     re.compile('套餐到期'),
     re.compile('剩余流量'),
     re.compile('距离下次重置剩余'),
+    re.compile('新网址'),
 )
 """默认忽略的节点"""
 
@@ -53,6 +58,7 @@ def from_base64(encoding: str, ignore: Collection[re.Pattern[str]] = DEFAULT_IGN
     - 套餐到期
     - 剩余流量
     - 距离下次重置剩余
+    - 新网址
     """
     from .core import Proxy
 
@@ -137,3 +143,42 @@ async def tests(
             await session.close()
 
     return result
+
+
+T = TypeVar('T')
+S = TypeVar('S', contravariant=True)
+
+
+@runtime_checkable
+class SupportGtLt[S](Protocol):
+    __slots__ = tuple()
+
+    @abstractmethod
+    def __gt__(self, o: S, /) -> bool: ...
+    def __lt__(self, o: S, /) -> bool: ...
+
+
+DEFAULT_COMPARATOR = lambda x: x
+
+
+class CustomPriorityQueue(Generic[T, S], Queue[T]):
+    """支持自定义优先级的优先队列"""
+
+    def __init__(
+        self, priority: Callable[[T], SupportGtLt[S]] = DEFAULT_COMPARATOR, maxsize: int = 0
+    ) -> None:
+        self._prio = priority
+        self._auto_id: int = 0
+        super().__init__(maxsize)
+
+    def _init(self, maxsize: int) -> None:
+        self._queue: list[tuple[SupportGtLt[S], int, T]] = list()
+
+    def _get(self) -> T:
+        _, _, item = heappop(self._queue)
+        return item
+
+    def _put(self, item: T) -> None:
+        self._auto_id += 1
+        entity = (self._prio(item), self._auto_id, item)
+        heappush(self._queue, entity)
