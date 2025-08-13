@@ -70,7 +70,7 @@ class Proxy:
             return
 
         cmd = (
-            'sslocal.exe',
+            'sslocal',
             '-b',
             f'localhost:{port}',
             '-s',
