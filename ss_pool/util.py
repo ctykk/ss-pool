@@ -9,9 +9,8 @@ from heapq import heappop, heappush
 from typing import TYPE_CHECKING, Callable, Collection, Generic, Protocol, TypeVar, runtime_checkable
 from urllib.parse import unquote_plus
 
-from aiohttp import ClientSession, ClientTimeout
-
 if TYPE_CHECKING:
+    from aiohttp import ClientSession, ClientTimeout
     from .core import Proxy
 
 
@@ -73,6 +72,11 @@ def from_base64(encoding: str, ignore: Collection[str | re.Pattern[str]] | None 
 
 async def test(proxy: Proxy, session: ClientSession | None = None, timeout: float = 10) -> bool:
     """测试节点有效性"""
+    if not timeout > 0:
+        raise ValueError(f'timeout={timeout} 必须为正整数')
+
+    from aiohttp import ClientSession, ClientTimeout
+
     flag = False
     # session 为 None，就创建新 session，并在结束时关闭该新 session
     if session is None:
@@ -105,6 +109,11 @@ async def tests(
     semaphore: Semaphore | None = None,
 ) -> dict[Proxy, bool]:
     """并发测试多个节点的有效性"""
+    if not timeout > 0:
+        raise ValueError(f'timeout={timeout} 必须为正整数')
+
+    from aiohttp import ClientSession
+
     result: dict[Proxy, bool] = dict()
     # 限制 _run 的并发数
     semaphore = semaphore if semaphore is not None else Semaphore(10)

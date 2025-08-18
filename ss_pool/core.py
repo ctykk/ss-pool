@@ -144,7 +144,7 @@ class ProxyPool:
         """
         :param max_acquire: 同时能使用的最大节点数（小于等于 0 为无限制）
         :param disable_until: 节点禁用持续时间（秒）
-        :param test_timeout: 测试节点可用性的超时时间
+        :param test_timeout: 测试节点可用性的超时时间（小于等于 0 时不测试节点可用性）
         :param acl: 路由配置
         """
         self._acl = acl
@@ -167,38 +167,48 @@ class ProxyPool:
         if self._enable_sem:
             await self._acquire_sem.acquire()
 
-        # 从 active 获取节点，若 active 已空从 standby 获取
         try:
-            proxy = self._active.get_nowait()
-        except QueueEmpty:
-            proxy = await self._standby.get()
+            # 从 active 获取节点，若 active 已空从 standby 获取
+            try:
+                proxy = self._active.get_nowait()
+            except QueueEmpty:
+                proxy = await self._standby.get()
 
-        # 如果节点被禁用就等待禁用结束（standby 的队头应当为最久未被使用的节点）
-        if proxy.is_disabled():
-            await sleep(proxy.disable_until - monotonic())
+            # 如果节点被禁用就等待禁用结束（standby 的队头应当为最久未被使用的节点）
+            if proxy.is_disabled():
+                await sleep(proxy.disable_until - monotonic())
 
-        # 节点未启动就启动它
-        if not proxy.is_started():
-            await proxy.start(acl=self._acl)
+            # 节点未启动就启动它
+            if not proxy.is_started():
+                await proxy.start(acl=self._acl)
 
-        return proxy
+            return proxy
+
+        # 获取节点失败时释放 _acquire_sem
+        except Exception:
+            if self._enable_sem:
+                self._acquire_sem.release()
+            raise
 
     def release(self, proxy: Proxy) -> None:
         """释放一个节点"""
-        # 节点仍处于禁用状态，就关闭其进程，并放回 standby
-        if proxy.is_disabled():
-            proxy.stop()
-            self._standby.put_nowait(proxy)
-        else:
-            # 节点仍可用，将节点放回 active，active 已满就放到 standby
-            try:
-                self._active.put_nowait(proxy)
-            except QueueFull:
+        try:
+            # 节点仍处于禁用状态，就关闭其进程，并放回 standby
+            if proxy.is_disabled():
                 proxy.stop()
                 self._standby.put_nowait(proxy)
+            else:
+                # 节点仍可用，将节点放回 active，active 已满就放到 standby
+                try:
+                    self._active.put_nowait(proxy)
+                except QueueFull:
+                    proxy.stop()
+                    self._standby.put_nowait(proxy)
 
-        if self._enable_sem:
-            self._acquire_sem.release()
+        # 释放节点失败时始终释放 _acquire_sem
+        finally:
+            if self._enable_sem:
+                self._acquire_sem.release()
 
     @asynccontextmanager
     async def use(self) -> AsyncGenerator[Proxy]:
@@ -215,21 +225,31 @@ class ProxyPool:
 
     async def start(self) -> Self:
         """启动代理池"""
-        # 启动所有节点
-        await gather(*[p.start(acl=self._acl) for p in self._all])
-        # 测试所有节点的有效性
-        proxy_status = await tests(*self._all, timeout=self._test_timeout)
-        for p, s in proxy_status.items():
-            # 节点通过检测，将节点放入 active，active 已满就放到 standby
-            if s:
+        # test_timeout 小于等于 0 时不测试节点有效性
+        if self._test_timeout <= 0:
+            for p in self._all:
                 try:
                     self._active.put_nowait(p)
                 except QueueFull:
                     p.stop()
                     self._standby.put_nowait(p)
-            # 节点未通过检测，关闭该节点的进程
-            else:
-                p.stop()
+
+        else:
+            # 启动所有节点
+            await gather(*[p.start(acl=self._acl) for p in self._all])
+            # 测试所有节点的有效性
+            proxy_status = await tests(*self._all, timeout=self._test_timeout)
+            for p, s in proxy_status.items():
+                # 节点通过检测，将节点放入 active，active 已满就放到 standby
+                if s:
+                    try:
+                        self._active.put_nowait(p)
+                    except QueueFull:
+                        p.stop()
+                        self._standby.put_nowait(p)
+                # 节点未通过检测，关闭该节点的进程
+                else:
+                    p.stop()
 
         if self._active.qsize() == 0:
             raise ProxyError('无可用节点')
