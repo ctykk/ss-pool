@@ -1,16 +1,12 @@
 [project]
 name = "ss-pool"
-version = "0.1.5"
+version = "0.2.0"
+description = "基于 sslocal( https://github.com/shadowsocks/shadowsocks-rust ) 的代理池"
 requires-python = ">=3.13"
-dependencies = ["aiohttp>=3.12.14"]
+dependencies = []
 
 [dependency-groups]
-dev = [
-    "colorama>=0.4.6",
-    "loguru>=0.7.3",
-    "patchright>=1.52.5",
-    "playwright>=1.53.0",
-]
+dev = ["aiohttp>=3.12.15", "loguru>=0.7.3"]
 
 [tool.setuptools]
 packages = ["ss_pool"]

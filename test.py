@@ -11,34 +11,34 @@ async def main() -> None:
     with open('./temp/7c151fe3.txt', 'r') as fp:
         proxies = from_base64(fp.read())
 
-    PROXY_HISTORY: dict[str, int] = defaultdict(int)
-    """记录节点的使用次数"""
+    # PROXY_HISTORY: dict[str, int] = defaultdict(int)
+    # """记录节点的使用次数"""
 
-    async def fetch(session: ClientSession, pool: ProxyPool) -> None:
-        """从代理池中获取代理看看能否访问"""
-        # 成功就返回，失败就拿出下一节点重试
-        while True:
-            async with pool.use() as proxy:
-                PROXY_HISTORY[proxy.name] += 1
-                try:
-                    # 非香港的节点都应失败
-                    proxy_url = proxy.url if proxy.name.startswith('香港') else 'http://localhost:12345'
-                    async with session.get('https://cp.cloudflare.com', proxy=proxy_url) as resp:
-                        resp.raise_for_status()
-                        logger.success(proxy)
-                        return
+    # async def fetch(session: ClientSession, pool: ProxyPool) -> None:
+    #     """从代理池中获取代理看看能否访问"""
+    #     # 成功就返回，失败就拿出下一节点重试
+    #     while True:
+    #         async with pool.use() as proxy:
+    #             PROXY_HISTORY[proxy.name] += 1
+    #             try:
+    #                 # 非香港的节点都应失败
+    #                 proxy_url = proxy.url if proxy.name.startswith('香港') else 'http://localhost:12345'
+    #                 async with session.get('https://cp.cloudflare.com', proxy=proxy_url) as resp:
+    #                     resp.raise_for_status()
+    #                     logger.success(proxy)
+    #                     return
 
-                except Exception as e:
-                    logger.error(f'{proxy} {type(e).__name__}({e})')
-                    pool.disable(proxy)
+    #             except Exception as e:
+    #                 logger.error(f'{proxy} {type(e).__name__}({e})')
+    #                 pool.disable(proxy)
 
-    async with ProxyPool(proxies) as pool:
-        async with ClientSession(cookie_jar=DummyCookieJar()) as session:
-            await gather(*[fetch(session, pool) for _ in range(300)])
+    # async with ProxyPool(proxies) as pool:
+    #     async with ClientSession(cookie_jar=DummyCookieJar()) as session:
+    #         await gather(*[fetch(session, pool) for _ in range(300)])
 
-    print('\n========== 节点使用记录 ==========')
-    for p, c in sorted(PROXY_HISTORY.items(), key=lambda kv: kv[1], reverse=True):
-        print(f'{p}\t{c}')
+    # print('\n========== 节点使用记录 ==========')
+    # for p, c in sorted(PROXY_HISTORY.items(), key=lambda kv: kv[1], reverse=True):
+    #     print(f'{p}\t{c}')
 
     # # 启动所有节点
     # await gather(*[p.start() for p in proxies])
@@ -59,6 +59,9 @@ async def main() -> None:
     #     print(g)
     #     for p in ps:
     #         print(p.name)
+
+    async with ProxyPool(proxies) as pool:
+        print(pool.count())
 
 
 if __name__ == '__main__':
