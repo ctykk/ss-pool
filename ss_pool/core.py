@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from asyncio import Queue, QueueEmpty, QueueFull, Semaphore, gather, get_running_loop, sleep
+from asyncio import Queue, QueueEmpty, QueueFull, Semaphore, gather, get_event_loop, sleep
 from asyncio.subprocess import DEVNULL, Process, create_subprocess_exec
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -161,6 +161,7 @@ class ProxyPool:
         :param acl: 代理路由规则配置文件路径（可选）
         """
         self._acl = acl
+        self._test_timeout = test_timeout
 
         # 所有节点（已去重）
         self._all: list[Proxy] = list(set(proxies))
@@ -170,9 +171,6 @@ class ProxyPool:
         self._active: Queue[Proxy] = CustomPriorityQueue(lambda p: p.disable_until, maxsize=max_acquire)
         ## 后备队列：存放被禁用或活跃队列满时的代理
         self._standby: Queue[Proxy] = CustomPriorityQueue(lambda p: p.disable_until)
-
-        # 启动代理池（需在事件循环中运行）
-        get_running_loop().run_until_complete(self.start(test_timeout))
 
         # 设置信号量控制并发访问（不超过可用节点数）
         if max_acquire <= 0:
@@ -289,6 +287,7 @@ class ProxyPool:
             p.stop()
 
     async def __aenter__(self) -> Self:
+        await self.start(self._test_timeout)
         return self
 
     async def __aexit__(self, et, ev, eb) -> bool | None:
