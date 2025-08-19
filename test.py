@@ -8,7 +8,7 @@ from ss_pool import ProxyPool, from_base64, group_by_location, tests
 
 
 async def main() -> None:
-    with open('./temp/7c151fe3.txt', 'r') as fp:
+    with open('temp/proxy.base64', 'r') as fp:
         proxies = from_base64(fp.read())
 
     # PROXY_HISTORY: dict[str, int] = defaultdict(int)
