@@ -161,6 +161,7 @@ class ProxyPool:
         :param acl: 代理路由规则配置文件路径（可选）
         """
         self._acl = acl
+        self._max_acquire = max_acquire
         self._test_timeout = test_timeout
 
         # 所有节点（已去重）
@@ -171,12 +172,6 @@ class ProxyPool:
         self._active: Queue[Proxy] = CustomPriorityQueue(lambda p: p.disable_until, maxsize=max_acquire)
         ## 后备队列：存放被禁用或活跃队列满时的代理
         self._standby: Queue[Proxy] = CustomPriorityQueue(lambda p: p.disable_until)
-
-        # 设置信号量控制并发访问（不超过可用节点数）
-        if max_acquire <= 0:
-            self._acquire_sem = Semaphore(self.count())
-        else:
-            self._acquire_sem = Semaphore(min(max_acquire, self.count()))
 
     async def acquire(self) -> Proxy:
         """获取可用节点"""
@@ -280,6 +275,13 @@ class ProxyPool:
         # 确保至少有一个可用节点
         if self._active.qsize() == 0:
             raise ProxyError('无可用节点')
+
+        # 设置信号量控制并发访问（不超过可用节点数）
+        print(self._max_acquire, self.count())
+        if self._max_acquire <= 0:
+            self._acquire_sem = Semaphore(self.count())
+        else:
+            self._acquire_sem = Semaphore(min(self._max_acquire, self.count()))
 
     def stop(self) -> None:
         """关闭代理池：停止所有节点的进程"""
