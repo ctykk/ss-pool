@@ -1,6 +1,6 @@
 [project]
 name = "ss-pool"
-version = "0.2.1"
+version = "0.2.2"
 description = "基于 sslocal( https://github.com/shadowsocks/shadowsocks-rust ) 的代理池"
 requires-python = ">=3.13"
 dependencies = []

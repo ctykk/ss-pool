@@ -1,4 +1,4 @@
-name: Build Wheel and Publish on Github-Release
+name: 构建并发布 whl 到 github release
 
 on:
   push:
@@ -12,28 +12,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install uv and Install python
+      - name: 安装 uv 和 python
         uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.13"
 
-      - name: Check Version
+      - name: 检查项目版本与标签版本是否匹配
         id: check_version
         run: |
           TAG_VER=$( echo ${{ github.ref_name }} | sed 's/^v-//' )
           PROJ_VER=$( uv run python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])" )
           if [ "$PROJ_VER" != "$TAG_VER" ]; then
-            echo "❌ Version mismatch detected! TAG_VER-'$TAG_VER' != PROJ_VER-'$PROJ_VER'"
+            echo "❌ 版本不匹配！ TAG_VER-'$TAG_VER' != PROJ_VER-'$PROJ_VER'"
             exit 1
           fi
           echo "VERSION=${TAG_VER}" >> $GITHUB_ENV
 
-      - name: Build with uv
+      - name: 用 uv 构建 whl
         run: uv build --no-sources
 
-      - name: Upload artifacts
+      - name: 发布到 release/版本号
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.whl
-          tag_name: ${{ github.ref }}
           name: ${{ env.VERSION }}
+
+      - name: 替换文件名的版本号为 latest
+        run: |
+          for f in dist/*"${VERSION}"*; do
+            mv "$f" "${f//${VERSION}/latest}"
+          done
+
+      - name: 发布到 release/latest
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          tag_name: latest
+          name: latest
+          make_latest: true
