@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable, Collection, Generic, Protocol, TypeV
 from urllib.parse import unquote_plus
 
 if TYPE_CHECKING:
-    from aiohttp import ClientSession, ClientTimeout
+    from aiohttp import ClientSession
     from .core import Proxy
 
 
@@ -72,7 +72,7 @@ def from_base64(encoding: str, ignore: Collection[str | re.Pattern[str]] | None 
 
 async def test(proxy: Proxy, session: ClientSession | None = None, timeout: float = 10) -> bool:
     """测试节点有效性"""
-    if not timeout > 0:
+    if timeout <= 0:
         raise ValueError(f'timeout={timeout} 必须为正整数')
 
     from aiohttp import ClientSession, ClientTimeout
@@ -109,7 +109,7 @@ async def tests(
     semaphore: Semaphore | None = None,
 ) -> dict[Proxy, bool]:
     """并发测试多个节点的有效性"""
-    if not timeout > 0:
+    if timeout <= 0:
         raise ValueError(f'timeout={timeout} 必须为正整数')
 
     from aiohttp import ClientSession
@@ -142,33 +142,34 @@ async def tests(
 
 
 T = TypeVar('T')
-S = TypeVar('S', contravariant=True)
+P = TypeVar('P', contravariant=True)
 
 
 @runtime_checkable
-class SupportGtLt[S](Protocol):
+class SupportGtLt(Protocol, Generic[P]):
     __slots__ = tuple()
 
     @abstractmethod
-    def __gt__(self, o: S, /) -> bool: ...
-    def __lt__(self, o: S, /) -> bool: ...
+    def __gt__(self, o: P, /) -> bool: ...
+    def __lt__(self, o: P, /) -> bool: ...
 
 
-DEFAULT_COMPARATOR = lambda x: x
+DEFAULT_PRIORITY = lambda x: x
+"""默认优先级计算方法"""
 
 
-class CustomPriorityQueue(Generic[T, S], Queue[T]):
+class CustomPriorityQueue(Generic[T, P], Queue[T]):
     """支持自定义优先级的优先队列"""
 
     def __init__(
-        self, priority: Callable[[T], SupportGtLt[S]] = DEFAULT_COMPARATOR, maxsize: int = 0
+        self, priority: Callable[[T], SupportGtLt[P]] = DEFAULT_PRIORITY, maxsize: int = 0
     ) -> None:
         self._prio = priority
         self._auto_id: int = 0
         super().__init__(maxsize)
 
     def _init(self, maxsize: int) -> None:
-        self._queue: list[tuple[SupportGtLt[S], int, T]] = list()
+        self._queue: list[tuple[SupportGtLt[P], int, T]] = list()
 
     def _get(self) -> T:
         _, _, item = heappop(self._queue)

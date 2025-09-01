@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from asyncio import Queue, QueueEmpty, QueueFull, Semaphore, gather, get_event_loop, sleep
+from asyncio import Queue, gather, sleep
 from asyncio.subprocess import DEVNULL, Process, create_subprocess_exec
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -31,7 +31,7 @@ class Proxy:
         self.name: Final[str] = name
 
         # 节点状态
-        self.disable_until: float = monotonic()  # 禁用解除时间
+        self._disable_until: float = monotonic()  # 禁用解除时间
         self._process: Process | None = None  #  节点进程
         self._port: int | None = None  #  本地绑定端口
 
@@ -125,9 +125,17 @@ class Proxy:
             self._process = None
         self._port = None
 
+    def disable(self, t: float = 60) -> None:
+        """
+        禁用代理指定时间
+
+        :param t: 禁用时长（秒）
+        """
+        self._disable_until = monotonic() + t
+
     def is_disabled(self) -> bool:
         """检查节点当前是否被禁用"""
-        return self.disable_until > monotonic()
+        return self._disable_until > monotonic()
 
     def __repr__(self) -> str:
         return f'{type(self).__name__}(name="{self.name}", server_addr="{self._server_addr}", encrypt_method="{self._encrypt_method}", password="{self._password}")'
@@ -150,56 +158,33 @@ class ProxyPool:
     def __init__(
         self,
         proxies: Collection[Proxy],
-        max_acquire: int = 0,
         test_timeout: float = 10,
         acl: str | Path | None = None,
     ) -> None:
         """
         :param proxies: 初始代理集合
-        :param max_acquire: 最大并发获取数（小于等于 0 表示无限制）
         :param test_timeout: 代理测试超时时间（秒）（小于等于 0 表示跳过测试）
         :param acl: 代理路由规则配置文件路径（可选）
         """
         self._acl = acl
-        self._max_acquire = max_acquire
         self._test_timeout = test_timeout
 
         # 所有节点（已去重）
         self._all: list[Proxy] = list(set(proxies))
 
-        # 按禁用解除时间排序
-        ## 活跃队列：存放当前可用代理，容量限制为 max_acquire
-        self._active: Queue[Proxy] = CustomPriorityQueue(lambda p: p.disable_until, maxsize=max_acquire)
-        ## 后备队列：存放被禁用或活跃队列满时的代理
-        self._standby: Queue[Proxy] = CustomPriorityQueue(lambda p: p.disable_until)
-
     async def acquire(self) -> Proxy:
         """获取可用节点"""
+        proxy = await self._queue.get()
 
-        # 等待信号量许可
-        await self._acquire_sem.acquire()
+        # 若代理被禁用，等待至禁用解除
+        if proxy.is_disabled():
+            await sleep(proxy._disable_until - monotonic())
 
-        try:
-            # 优先从活跃队列获取，空时转后备队列
-            try:
-                proxy = self._active.get_nowait()
-            except QueueEmpty:
-                proxy = await self._standby.get()
+        # 确保代理进程已启动
+        if not proxy.is_started():
+            await proxy.start(acl=self._acl)
 
-            # 若代理被禁用，等待至禁用解除
-            if proxy.is_disabled():
-                await sleep(proxy.disable_until - monotonic())
-
-            # 确保代理进程已启动
-            if not proxy.is_started():
-                await proxy.start(acl=self._acl)
-
-            return proxy
-
-        # 异常时释放信号量避免死锁
-        except Exception:
-            self._acquire_sem.release()
-            raise
+        return proxy
 
     def release(self, proxy: Proxy) -> None:
         """
@@ -207,21 +192,10 @@ class ProxyPool:
 
         :param proxy: 要释放的节点
         """
-        try:
-            # 节点已禁用：停止进程并放入备用队列
-            if proxy.is_disabled():
-                proxy.stop()
-                self._standby.put_nowait(proxy)
-            else:
-                # 节点仍可用：尝试放回活跃队列，满时转入后备队列
-                try:
-                    self._active.put_nowait(proxy)
-                except QueueFull:
-                    proxy.stop()
-                    self._standby.put_nowait(proxy)
-
-        finally:
-            self._acquire_sem.release()
+        # 节点已禁用：停止进程
+        if proxy.is_disabled():
+            proxy.stop()
+        self._queue.put_nowait(proxy)
 
     @asynccontextmanager
     async def use(self) -> AsyncGenerator[Proxy]:
@@ -232,14 +206,14 @@ class ProxyPool:
         finally:
             self.release(proxy)
 
-    def disable(self, proxy: Proxy, second: float = 60) -> None:
+    def disable(self, proxy: Proxy, t: float = 60) -> None:
         """
         禁用代理指定时间
 
         :param proxy: 要禁用的节点
-        :param second: 禁用时长（秒）
+        :param t: 禁用时长（秒）
         """
-        proxy.disable_until = monotonic() + second
+        proxy.disable(t)
 
     async def start(self, timeout: float) -> None:
         """
@@ -247,13 +221,13 @@ class ProxyPool:
 
         :raises ProxyError: 无可用代理
         """
+        # 按禁用解除时间排序
+        self._queue: Queue[Proxy] = CustomPriorityQueue(lambda p: p._disable_until)
+
         # timeout <= 0 时跳过测试直接初始化
         if timeout <= 0:
             for p in self._all:
-                try:
-                    self._active.put_nowait(p)
-                except QueueFull:
-                    self._standby.put_nowait(p)
+                self._queue.put_nowait(p)
 
         else:
             # 并行启动所有节点
@@ -261,27 +235,16 @@ class ProxyPool:
             # 批量测试节点有效性
             proxy_status = await tests(*self._all, timeout=timeout)
             for p, s in proxy_status.items():
-                # 有效节点优先放入活跃队列，满时放入后备队列
+                # 有效节点放入队列
                 if s:
-                    try:
-                        self._active.put_nowait(p)
-                    except QueueFull:
-                        p.stop()
-                        self._standby.put_nowait(p)
+                    self._queue.put_nowait(p)
                 # 失败节点直接关闭
                 else:
                     p.stop()
 
         # 确保至少有一个可用节点
-        if self._active.qsize() == 0:
+        if self._queue.qsize() == 0:
             raise ProxyError('无可用节点')
-
-        # 设置信号量控制并发访问（不超过可用节点数）
-        print(self._max_acquire, self.count())
-        if self._max_acquire <= 0:
-            self._acquire_sem = Semaphore(self.count())
-        else:
-            self._acquire_sem = Semaphore(min(self._max_acquire, self.count()))
 
     def stop(self) -> None:
         """关闭代理池：停止所有节点的进程"""
@@ -299,6 +262,6 @@ class ProxyPool:
         """
         获取节点总数（未被使用的可用节点数）
 
-        NOTICE: 仅包含活跃队列和后备队列中的节点数，不代表总节点数
+        # NOTICE: 仅包含队列中的节点数，不代表总节点数
         """
-        return self._active.qsize() + self._standby.qsize()
+        return self._queue.qsize()
