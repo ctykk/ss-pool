@@ -195,7 +195,7 @@ class ProxyPool:
         # 节点已禁用：停止进程
         if proxy.is_disabled():
             proxy.stop()
-        self._queue.put_nowait
+        self._queue.put_nowait(proxy)
 
     @asynccontextmanager
     async def use(self) -> AsyncGenerator[Proxy]:
@@ -222,7 +222,6 @@ class ProxyPool:
         :raises ProxyError: 无可用代理
         """
         # 按禁用解除时间排序
-        ## 存放可用代理
         self._queue: Queue[Proxy] = CustomPriorityQueue(lambda p: p._disable_until)
 
         # timeout <= 0 时跳过测试直接初始化
